@@ -20,7 +20,7 @@
       "mode": "daily",
       "time_str": "18:00",
       "date_str": "",
-      "interval_min": 0,
+      "interval_min": 240,
       "weekdays": [],
       "active": true
     }
