@@ -887,7 +887,7 @@ def main():
         if is_structured:
             save_result(result, run_number, run_id, timestamp, market_data, model, cost, "")
             save_conclusion(result, run_number, timestamp, market_data)
-            trim_history_files()
+        trim_history_files()
         send_discord_diagnostic(config, timestamp, run_number, notify_reason,
                                 result if is_structured else {}, market_data)
         print("\nPipeline complete (no significant change).")
@@ -908,9 +908,9 @@ def main():
     if is_structured:
         save_result(result, run_number, run_id, timestamp, market_data, model, cost, discord_msg_en)
         save_conclusion(result, run_number, timestamp, market_data)
-        trim_history_files()
         print(f"  Result saved to {HISTORY_CSV}")
         print(f"  Conclusions saved to {CONCLUSIONS_FILE}")
+    trim_history_files()
 
     # Translate
     print("  Translating to Polish...")
