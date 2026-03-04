@@ -741,10 +741,15 @@ def translate_to_polish(english_msg: str, claude_cfg: dict) -> str:
     claude = ClaudeCode(
         system_prompt="You are a translator. Translate the text to Polish. Keep ALL formatting intact: emoji, bold (**), lines (│ ═ ─), bars (█ ░), structure. Translate ONLY the text content — never change numbers, ticker symbols, dates, or formatting characters. Return ONLY the translated text, nothing else.",
         timeout=claude_cfg.get("timeout", 300),
-        max_budget_usd=0.10,
+        max_budget_usd=0.30,
     )
     resp = claude.ask(f"Translate to Polish. Keep exact formatting:\n\n{english_msg}")
-    return resp.text.strip() if resp.text else english_msg
+    text = resp.text.strip() if resp.text else ""
+    # If translation failed or returned JSON error, return empty
+    if not text or text.startswith("{") or "error" in text[:50].lower():
+        print("  WARNING: Translation failed, sending English only.")
+        return ""
+    return text
 
 
 def send_discord_diagnostic(config: dict, timestamp: str, run_number: int,
@@ -915,11 +920,14 @@ def main():
     # Translate
     print("  Translating to Polish...")
     discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
-    print("  Translation complete.")
 
-    # Combine EN + PL
-    separator = "\n\n\U0001f1f5\U0001f1f1 **WERSJA POLSKA:**\n" + "\u2550" * 40 + "\n\n"
-    discord_full = discord_msg_en + separator + discord_msg_pl
+    # Combine EN + PL (skip Polish section if translation failed)
+    if discord_msg_pl:
+        print("  Translation complete.")
+        separator = "\n\n\U0001f1f5\U0001f1f1 **WERSJA POLSKA:**\n" + "\u2550" * 40 + "\n\n"
+        discord_full = discord_msg_en + separator + discord_msg_pl
+    else:
+        discord_full = discord_msg_en
 
     print(f"\n{'─' * 60}")
     print(discord_full)
