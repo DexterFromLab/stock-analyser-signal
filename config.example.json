@@ -10,7 +10,7 @@
   "discord": {
     "active": true,
     "webhook_url": "",
-    "notify_scheduler": true,
+    "notify_scheduler": false,
     "notify_claude": false
   },
   "scheduler_jobs": [

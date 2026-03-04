@@ -878,11 +878,16 @@ def main():
     notify, notify_reason = should_notify(history, result if is_structured else {})
 
     if not notify:
-        # Diagnostic message — no save, no translation, no Discord
+        # Diagnostic message — save result (for continuity) but no translation
         rec = result.get("recommendation", "?") if is_structured else "?"
         s_short = result.get("score_short_term", "?") if is_structured else "?"
         print(f"  SKIP — {notify_reason}")
-        print(f"  Current: {rec} ({s_short}/100) | No changes saved or sent.")
+        print(f"  Current: {rec} ({s_short}/100) | Saving result, skipping translation.")
+        # Save so run_number stays continuous and next run sees this result
+        if is_structured:
+            save_result(result, run_number, run_id, timestamp, market_data, model, cost, "")
+            save_conclusion(result, run_number, timestamp, market_data)
+            trim_history_files()
         send_discord_diagnostic(config, timestamp, run_number, notify_reason,
                                 result if is_structured else {}, market_data)
         print("\nPipeline complete (no significant change).")
