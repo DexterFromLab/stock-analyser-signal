@@ -1,0 +1,62 @@
+{
+  "context_keeper": {
+    "active": false,
+    "prompt": "You are a senior quantitative market analyst specializing in NASDAQ and US equity markets. Provide precise, data-driven analysis with specific numbers. Be direct and actionable. Score 1-100 where 1=strongest sell, 50=neutral, 100=strongest buy.",
+    "auto_first": false,
+    "auto_every": false,
+    "auto_remind": false,
+    "interval": 100
+  },
+  "discord": {
+    "active": true,
+    "webhook_url": "",
+    "notify_scheduler": true,
+    "notify_claude": false
+  },
+  "scheduler_jobs": [
+    {
+      "name": "stock_analysis",
+      "code": "exec(open('analyse.py').read())",
+      "mode": "daily",
+      "time_str": "18:00",
+      "date_str": "",
+      "interval_min": 0,
+      "weekdays": [],
+      "active": true
+    }
+  ],
+  "analysis": {
+    "symbols": {
+      "primary": [
+        "QQQ",
+        "^IXIC"
+      ],
+      "secondary": [
+        "SPY",
+        "^VIX",
+        "^TNX"
+      ],
+      "crypto_ref": [
+        "BTC-USD"
+      ]
+    },
+    "news_urls": [
+      "https://www.reuters.com/markets/",
+      "https://www.cnbc.com/world-markets/",
+      "https://finance.yahoo.com/topic/stock-market-news/",
+      "https://www.marketwatch.com/latest-news"
+    ],
+    "data_periods": {
+      "hourly_days": 59,
+      "daily_months": 6,
+      "weekly_months": 24
+    },
+    "claude": {
+      "model": null,
+      "timeout": 300,
+      "max_budget_usd": 0.5,
+      "system_prompt": null
+    },
+    "history_lookback": 10
+  }
+}
