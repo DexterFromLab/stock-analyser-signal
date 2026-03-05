@@ -5,9 +5,13 @@ Fetches market data, scrapes news, runs AI analysis, logs to CSV, notifies Disco
 
 import json
 import csv
+import logging
 import os
+import re
 import sys
+import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -15,7 +19,6 @@ from pathlib import Path
 # Infrastructure imports (provided by ClaudeCodeIde / automate)
 # ---------------------------------------------------------------------------
 from claude_code import ClaudeCode
-from scraper import Scraper
 from discord_notifier import DiscordNotifier
 import yfinance as yf
 
@@ -28,6 +31,11 @@ DATA_DIR = SCRIPT_DIR / "data"
 HISTORY_CSV = DATA_DIR / "analysis_history.csv"
 SNAPSHOT_CSV = DATA_DIR / "market_snapshots.csv"
 CONCLUSIONS_FILE = DATA_DIR / "conclusions.json"
+
+LOG_FILE = DATA_DIR / "analyse.log"
+LOG_MAX_LINES = 30_000
+
+log = logging.getLogger("analyse")
 
 HISTORY_COLUMNS = [
     "timestamp", "run_number", "run_id",
@@ -73,6 +81,41 @@ ANALYSIS_SCHEMA = {
         "detailed_analysis", "comparison_to_previous",
     ],
 }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Logging setup
+# ═══════════════════════════════════════════════════════════════════════════
+def trim_log_file():
+    """Keep log file to LOG_MAX_LINES lines by removing oldest entries."""
+    if not LOG_FILE.exists():
+        return
+    try:
+        lines = LOG_FILE.read_text(encoding="utf-8").splitlines()
+        if len(lines) > LOG_MAX_LINES:
+            LOG_FILE.write_text("\n".join(lines[-LOG_MAX_LINES:]) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def setup_logging():
+    """Configure logging to console + file."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    trim_log_file()
+
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(fmt)
+
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(fmt)
+
+    log.setLevel(logging.DEBUG)
+    log.addHandler(file_handler)
+    log.addHandler(console_handler)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -143,9 +186,9 @@ def save_conclusion(result: dict, run_number: int, timestamp: str, market_data: 
     }
 
     conclusions.append(entry)
-    # Keep last 50 entries max
-    if len(conclusions) > 50:
-        conclusions = conclusions[-50:]
+    # Keep last 10 entries max
+    if len(conclusions) > 10:
+        conclusions = conclusions[-10:]
     with open(CONCLUSIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(conclusions, f, indent=2, ensure_ascii=False)
 
@@ -188,7 +231,7 @@ def fetch_market_data(symbols_cfg: dict, periods_cfg: dict) -> dict:
     data = {}
 
     for sym in all_symbols:
-        print(f"  Fetching {sym}...")
+        log.info("Fetching %s...", sym)
         ticker = yf.Ticker(sym)
         entry = {"symbol": sym, "info": {}, "hourly": None, "daily": None, "weekly": None}
 
@@ -204,25 +247,25 @@ def fetch_market_data(symbols_cfg: dict, periods_cfg: dict) -> dict:
                 "week52_low": info.get("fiftyTwoWeekLow"),
             }
         except Exception as e:
-            print(f"    Warning: info fetch failed for {sym}: {e}")
+            log.warning("Info fetch failed for %s: %s", sym, e)
 
         try:
             h_days = periods_cfg.get("hourly_days", 59)
             entry["hourly"] = ticker.history(period=f"{h_days}d", interval="1h")
         except Exception as e:
-            print(f"    Warning: hourly fetch failed for {sym}: {e}")
+            log.warning("Hourly fetch failed for %s: %s", sym, e)
 
         try:
             d_months = periods_cfg.get("daily_months", 6)
             entry["daily"] = ticker.history(period=f"{d_months}mo", interval="1d")
         except Exception as e:
-            print(f"    Warning: daily fetch failed for {sym}: {e}")
+            log.warning("Daily fetch failed for %s: %s", sym, e)
 
         try:
             w_months = periods_cfg.get("weekly_months", 24)
             entry["weekly"] = ticker.history(period=f"{w_months}mo", interval="1wk")
         except Exception as e:
-            print(f"    Warning: weekly fetch failed for {sym}: {e}")
+            log.warning("Weekly fetch failed for %s: %s", sym, e)
 
         data[sym] = entry
 
@@ -338,18 +381,48 @@ def save_snapshot(market_data: dict, run_id: str, timestamp: str):
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 5 — Scrape news
 # ═══════════════════════════════════════════════════════════════════════════
-def scrape_news(urls: list[str]) -> str:
-    print("  Scraping news...")
-    scraper = Scraper()
-    results = scraper.scrape_many(urls)
+def fetch_news(rss_feeds: list[dict]) -> str:
+    """Fetch news from RSS feeds. Each feed: {"url": "...", "name": "..."}."""
     sections = ["## Latest Market News\n"]
-    for r in results:
-        if r.is_error:
-            sections.append(f"**{r.url}**: *Scrape failed — {r.error_msg}*\n")
-        else:
-            title = r.title or r.url
-            content = r.markdown[:30000] if r.markdown else "(empty)"
-            sections.append(f"### {title}\nSource: {r.url}\n\n{content}\n")
+
+    for feed in rss_feeds:
+        url = feed["url"]
+        name = feed.get("name", url)
+        max_items = feed.get("max_items", 15)
+        log.info("Fetching RSS: %s", name)
+
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                xml_data = resp.read()
+
+            root = ET.fromstring(xml_data)
+            items = root.findall(".//item")
+
+            sections.append(f"### {name}\n")
+            count = 0
+            for item in items[:max_items]:
+                title = (item.findtext("title") or "").strip()
+                desc = item.findtext("description") or ""
+                pub_date = (item.findtext("pubDate") or "").strip()
+
+                desc_clean = re.sub(r"<[^>]+>", "", desc).strip()
+                if len(desc_clean) > 500:
+                    desc_clean = desc_clean[:500] + "..."
+
+                sections.append(f"**{title}** ({pub_date})")
+                if desc_clean:
+                    sections.append(f"{desc_clean}\n")
+                else:
+                    sections.append("")
+                count += 1
+
+            log.info("Got %d items from %s", count, name)
+
+        except Exception as e:
+            log.warning("RSS fetch failed for %s: %s", name, e)
+            sections.append(f"**{name}**: *Fetch failed — {e}*\n")
+
     return "\n".join(sections)
 
 
@@ -444,6 +517,12 @@ Fill every field with real analysis. key_factors must include specific numbers. 
     if system_prompt:
         json_system = f"{system_prompt}\n\nIMPORTANT: You MUST respond with valid JSON only. No markdown, no text outside the JSON."
 
+    log.debug("=" * 40 + " SYSTEM PROMPT " + "=" * 40)
+    log.debug(json_system)
+    log.debug("=" * 40 + " USER PROMPT " + "=" * 40)
+    log.debug(prompt)
+    log.debug("=" * 40 + " END PROMPT " + "=" * 40)
+
     claude = ClaudeCode(
         model=claude_cfg.get("model"),
         system_prompt=json_system,
@@ -457,7 +536,14 @@ Fill every field with real analysis. key_factors must include specific numbers. 
     if resp.model:
         model = resp.model
 
+    log.debug("=" * 40 + " RAW RESPONSE " + "=" * 40)
+    log.debug("resp.text: %s", resp.text)
+    log.debug("resp.raw_json: %s", resp.raw_json)
+    log.debug("resp.model: %s | resp.cost_usd: %s", resp.model, resp.cost_usd)
+    log.debug("=" * 40 + " END RESPONSE " + "=" * 40)
+
     result = _parse_json_response(resp)
+    log.debug("Parsed result: %s", json.dumps(result, ensure_ascii=False, indent=2))
     return result, model, cost
 
 
@@ -738,16 +824,23 @@ def should_notify(history: list[dict], result: dict) -> tuple[bool, str]:
 
 def translate_to_polish(english_msg: str, claude_cfg: dict) -> str:
     """Translate Discord message to Polish using Claude."""
+    translate_system = "You are a translator. Translate the text to Polish. Keep ALL formatting intact: emoji, bold (**), lines (│ ═ ─), bars (█ ░), structure. Translate ONLY the text content — never change numbers, ticker symbols, dates, or formatting characters. Return ONLY the translated text, nothing else."
+    translate_prompt = f"Translate to Polish. Keep exact formatting:\n\n{english_msg}"
+    log.debug("=" * 40 + " TRANSLATION REQUEST " + "=" * 40)
+    log.debug("System: %s", translate_system)
+    log.debug("Prompt: %s", translate_prompt)
     claude = ClaudeCode(
-        system_prompt="You are a translator. Translate the text to Polish. Keep ALL formatting intact: emoji, bold (**), lines (│ ═ ─), bars (█ ░), structure. Translate ONLY the text content — never change numbers, ticker symbols, dates, or formatting characters. Return ONLY the translated text, nothing else.",
+        system_prompt=translate_system,
         timeout=claude_cfg.get("timeout", 300),
         max_budget_usd=0.30,
     )
-    resp = claude.ask(f"Translate to Polish. Keep exact formatting:\n\n{english_msg}")
+    resp = claude.ask(translate_prompt)
+    log.debug("Translation resp.text: %s", resp.text)
+    log.debug("Translation resp.model: %s | cost: %s", resp.model, resp.cost_usd)
     text = resp.text.strip() if resp.text else ""
     # If translation failed or returned JSON error, return empty
     if not text or text.startswith("{") or "error" in text[:50].lower():
-        print("  WARNING: Translation failed, sending English only.")
+        log.warning("Translation failed, sending English only.")
         return ""
     return text
 
@@ -768,7 +861,7 @@ def send_discord_diagnostic(config: dict, timestamp: str, run_number: int,
 
 
 def trim_history_files():
-    """Keep last 100 entries in CSV and 50 in conclusions.json."""
+    """Keep last 10 entries in CSV, conclusions.json, and snapshots."""
     # Trim CSV
     if HISTORY_CSV.exists():
         rows = []
@@ -777,14 +870,14 @@ def trim_history_files():
             fieldnames = reader.fieldnames
             for row in reader:
                 rows.append(row)
-        if len(rows) > 100:
-            rows = rows[-100:]
+        if len(rows) > 10:
+            rows = rows[-10:]
             with open(HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
                 writer.writerows(rows)
 
-    # Trim conclusions (already handled in save_conclusion with 50 limit)
+    # Trim conclusions (already handled in save_conclusion with 10 limit)
 
     # Trim snapshots
     if SNAPSHOT_CSV.exists():
@@ -794,9 +887,9 @@ def trim_history_files():
             fieldnames = reader.fieldnames
             for row in reader:
                 rows.append(row)
-        # ~6 symbols per run * 100 runs = 600 rows max
-        if len(rows) > 600:
-            rows = rows[-600:]
+        # ~6 symbols per run * 10 runs = 60 rows max
+        if len(rows) > 60:
+            rows = rows[-60:]
             with open(SNAPSHOT_CSV, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=fieldnames)
                 writer.writeheader()
@@ -806,88 +899,91 @@ def trim_history_files():
 def send_discord(config: dict, message: str):
     discord_cfg = config.get("discord", {})
     if not discord_cfg.get("active") or not discord_cfg.get("webhook_url"):
-        print("  Discord not configured — skipping notification.")
+        log.info("Discord not configured — skipping notification.")
         return
     notifier = DiscordNotifier(
         webhook_url=discord_cfg["webhook_url"],
         active=True,
     )
+    log.debug("Discord message content:\n%s", message)
     notifier.send_sync(message)
-    print("  Discord notification sent.")
+    log.info("Discord notification sent.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Main pipeline
 # ═══════════════════════════════════════════════════════════════════════════
 def main():
-    print("=" * 60)
-    print("Stock Analyser Signal — Starting analysis pipeline")
-    print("=" * 60)
+    setup_logging()
+    log.info("=" * 60)
+    log.info("Stock Analyser Signal — Starting analysis pipeline")
+    log.info("=" * 60)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     # Step 1: Load config
-    print("\n[1/7] Loading config...")
+    log.info("[1/7] Loading config...")
     config = load_config()
     analysis_cfg = config.get("analysis", {})
     symbols_cfg = analysis_cfg.get("symbols", {})
     periods_cfg = analysis_cfg.get("data_periods", {})
     claude_cfg = analysis_cfg.get("claude", {})
-    news_urls = analysis_cfg.get("news_urls", [])
+    rss_feeds = analysis_cfg.get("rss_feeds", [])
     lookback = analysis_cfg.get("history_lookback", 10)
 
     run_id = str(uuid.uuid4())[:8]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"  Run ID: {run_id} | Timestamp: {timestamp}")
+    log.info("Run ID: %s | Timestamp: %s", run_id, timestamp)
 
     # Step 2: Load history + conclusions
-    print("\n[2/7] Loading previous analyses...")
+    log.info("[2/7] Loading previous analyses...")
     history = load_history(lookback)
     conclusions = load_conclusions(lookback)
     run_number = len(history) + 1
     history_prompt = format_history_for_prompt(history, conclusions)
-    print(f"  Loaded {len(history)} previous analyses, {len(conclusions)} conclusions.")
+    log.info("Loaded %d previous analyses, %d conclusions.", len(history), len(conclusions))
 
     # Step 3: Fetch market data
-    print("\n[3/7] Fetching market data...")
+    log.info("[3/7] Fetching market data...")
     market_data = fetch_market_data(symbols_cfg, periods_cfg)
     market_prompt = format_market_data_for_prompt(market_data)
-    print(f"  Fetched data for {len(market_data)} symbols.")
+    log.info("Fetched data for %d symbols.", len(market_data))
 
     # Step 4: Save snapshot
-    print("\n[4/7] Saving market snapshot...")
+    log.info("[4/7] Saving market snapshot...")
     save_snapshot(market_data, run_id, timestamp)
-    print(f"  Snapshot saved to {SNAPSHOT_CSV}")
+    log.info("Snapshot saved to %s", SNAPSHOT_CSV)
 
     # Step 5: Scrape news
-    print("\n[5/7] Scraping news...")
-    news_prompt = scrape_news(news_urls)
-    print("  News scraping complete.")
+    log.info("[5/7] Scraping news...")
+    news_prompt = fetch_news(rss_feeds)
+    log.info("News scraping complete.")
 
     # Step 6: Run Claude analysis
-    print("\n[6/7] Running Claude analysis...")
+    log.info("[6/7] Running Claude analysis...")
     result, model, cost = run_analysis(market_prompt, news_prompt, history_prompt, claude_cfg, config, history)
 
     is_structured = not ("raw_text" in result and len(result) == 1)
 
     if is_structured:
-        print(f"  Analysis complete. Model: {model} | Cost: ${cost or '?'}")
-        print(f"  Recommendation: {result.get('recommendation')} | "
-              f"Scores: {result.get('score_short_term')}/{result.get('score_medium_term')}/{result.get('score_long_term')}")
+        log.info("Analysis complete. Model: %s | Cost: $%s", model, cost or "?")
+        log.info("Recommendation: %s | Scores: %s/%s/%s",
+                 result.get("recommendation"),
+                 result.get("score_short_term"), result.get("score_medium_term"), result.get("score_long_term"))
     else:
-        print(f"  WARNING: Claude returned raw text instead of structured JSON.")
-        print(f"  Will use raw text for notification.")
+        log.warning("Claude returned raw text instead of structured JSON.")
+        log.warning("Will use raw text for notification.")
 
     # Step 7: Decide whether to notify
-    print("\n[7/8] Evaluating significance...")
+    log.info("[7/8] Evaluating significance...")
     notify, notify_reason = should_notify(history, result if is_structured else {})
 
     if not notify:
         # Diagnostic message — save result (for continuity) but no translation
         rec = result.get("recommendation", "?") if is_structured else "?"
         s_short = result.get("score_short_term", "?") if is_structured else "?"
-        print(f"  SKIP — {notify_reason}")
-        print(f"  Current: {rec} ({s_short}/100) | Saving result, skipping translation.")
+        log.info("SKIP — %s", notify_reason)
+        log.info("Current: %s (%s/100) | Saving result, skipping translation.", rec, s_short)
         # Save so run_number stays continuous and next run sees this result
         if is_structured:
             save_result(result, run_number, run_id, timestamp, market_data, model, cost, "")
@@ -895,13 +991,13 @@ def main():
         trim_history_files()
         send_discord_diagnostic(config, timestamp, run_number, notify_reason,
                                 result if is_structured else {}, market_data)
-        print("\nPipeline complete (no significant change).")
+        log.info("Pipeline complete (no significant change).")
         return
 
-    print(f"  NOTIFY — {notify_reason}")
+    log.info("NOTIFY — %s", notify_reason)
 
     # Step 8: Build message, save, translate, send
-    print("\n[8/8] Building message, saving, translating...")
+    log.info("[8/8] Building message, saving, translating...")
 
     if is_structured:
         discord_msg_en = build_discord_message(result, timestamp, run_number, market_data, history)
@@ -913,29 +1009,29 @@ def main():
     if is_structured:
         save_result(result, run_number, run_id, timestamp, market_data, model, cost, discord_msg_en)
         save_conclusion(result, run_number, timestamp, market_data)
-        print(f"  Result saved to {HISTORY_CSV}")
-        print(f"  Conclusions saved to {CONCLUSIONS_FILE}")
+        log.info("Result saved to %s", HISTORY_CSV)
+        log.info("Conclusions saved to %s", CONCLUSIONS_FILE)
     trim_history_files()
 
     # Translate
-    print("  Translating to Polish...")
+    log.info("Translating to Polish...")
     discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
 
     # Combine EN + PL (skip Polish section if translation failed)
     if discord_msg_pl:
-        print("  Translation complete.")
+        log.info("Translation complete.")
         separator = "\n\n\U0001f1f5\U0001f1f1 **WERSJA POLSKA:**\n" + "\u2550" * 40 + "\n\n"
         discord_full = discord_msg_en + separator + discord_msg_pl
     else:
         discord_full = discord_msg_en
 
-    print(f"\n{'─' * 60}")
-    print(discord_full)
-    print(f"{'─' * 60}\n")
+    log.info("─" * 60)
+    log.info("Discord message:\n%s", discord_full)
+    log.info("─" * 60)
 
     send_discord(config, discord_full)
 
-    print("Pipeline complete.")
+    log.info("Pipeline complete.")
 
 
 if __name__ == "__main__":

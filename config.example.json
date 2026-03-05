@@ -40,11 +40,10 @@
         "BTC-USD"
       ]
     },
-    "news_urls": [
-      "https://www.reuters.com/markets/",
-      "https://www.cnbc.com/world-markets/",
-      "https://finance.yahoo.com/topic/stock-market-news/",
-      "https://www.marketwatch.com/latest-news"
+    "rss_feeds": [
+      {"name": "CNBC Top News", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100727362", "max_items": 15},
+      {"name": "CNBC World Markets", "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114", "max_items": 15},
+      {"name": "MarketWatch Top Stories", "url": "https://feeds.marketwatch.com/marketwatch/topstories/", "max_items": 10}
     ],
     "data_periods": {
       "hourly_days": 59,
