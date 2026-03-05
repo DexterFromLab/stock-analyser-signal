@@ -151,8 +151,20 @@ def load_conclusions(lookback: int) -> list[dict]:
         return []
 
 
+def _first_sentence(text: str, max_len: int = 200) -> str:
+    """Extract first sentence, truncate if needed."""
+    if not text:
+        return ""
+    # Find first sentence end
+    for end in [". ", ".\n", "."]:
+        idx = text.find(end)
+        if 0 < idx < max_len:
+            return text[:idx + 1]
+    return text[:max_len] + "..." if len(text) > max_len else text
+
+
 def save_conclusion(result: dict, run_number: int, timestamp: str, market_data: dict):
-    """Append full structured conclusion to conclusions.json."""
+    """Append condensed conclusion to conclusions.json — key data only."""
     conclusions = []
     if CONCLUSIONS_FILE.exists():
         try:
@@ -168,17 +180,15 @@ def save_conclusion(result: dict, run_number: int, timestamp: str, market_data: 
         "score_short_term": result.get("score_short_term"),
         "score_medium_term": result.get("score_medium_term"),
         "score_long_term": result.get("score_long_term"),
-        "short_term_outlook": result.get("short_term_outlook"),
-        "medium_term_outlook": result.get("medium_term_outlook"),
-        "long_term_outlook": result.get("long_term_outlook"),
-        "key_factors": result.get("key_factors", []),
-        "risks": result.get("risks", []),
-        "opportunities": result.get("opportunities", []),
-        "detailed_analysis": result.get("detailed_analysis"),
-        "comparison_to_previous": result.get("comparison_to_previous"),
+        "short_term_outlook": _first_sentence(result.get("short_term_outlook", "")),
+        "medium_term_outlook": _first_sentence(result.get("medium_term_outlook", "")),
+        "long_term_outlook": _first_sentence(result.get("long_term_outlook", "")),
+        "key_factors": [f[:120] for f in result.get("key_factors", [])[:4]],
+        "risks": [r[:100] for r in result.get("risks", [])[:2]],
+        "opportunities": [o[:100] for o in result.get("opportunities", [])[:2]],
+        "what_changed": _first_sentence(result.get("comparison_to_previous", "")),
         "prices": {
             "QQQ": market_data.get("QQQ", {}).get("info", {}).get("price"),
-            "IXIC": market_data.get("^IXIC", {}).get("info", {}).get("price"),
             "SPY": market_data.get("SPY", {}).get("info", {}).get("price"),
             "VIX": market_data.get("^VIX", {}).get("info", {}).get("price"),
             "BTC": market_data.get("BTC-USD", {}).get("info", {}).get("price"),
@@ -194,29 +204,31 @@ def save_conclusion(result: dict, run_number: int, timestamp: str, market_data: 
 
 
 def format_history_for_prompt(history: list[dict], conclusions: list[dict]) -> str:
-    """Format previous analyses for prompt — uses conclusions.json for full context."""
+    """Format previous analyses for prompt — condensed, ~8 lines per run."""
     if not conclusions:
         return "No previous analyses available. This is the first run."
 
     lines = ["## Your Previous Analyses (most recent last)\n"]
     for c in conclusions:
-        lines.append(f"### Run #{c.get('run_number', '?')} — {c.get('timestamp', '?')}")
-        lines.append(f"**Recommendation:** {c.get('recommendation', '?')} | "
-                      f"Scores: ST={c.get('score_short_term', '?')} MT={c.get('score_medium_term', '?')} LT={c.get('score_long_term', '?')}")
         prices = c.get("prices", {})
-        lines.append(f"Prices: QQQ=${prices.get('QQQ', '?')} | SPY=${prices.get('SPY', '?')} | VIX={prices.get('VIX', '?')} | BTC=${prices.get('BTC', '?')}")
-        lines.append(f"**Short-term:** {c.get('short_term_outlook', '?')}")
-        lines.append(f"**Medium-term:** {c.get('medium_term_outlook', '?')}")
-        lines.append(f"**Long-term:** {c.get('long_term_outlook', '?')}")
+        lines.append(
+            f"**Run #{c.get('run_number', '?')}** — {c.get('timestamp', '?')} | "
+            f"**{c.get('recommendation', '?')}** | "
+            f"ST={c.get('score_short_term', '?')} MT={c.get('score_medium_term', '?')} LT={c.get('score_long_term', '?')}"
+        )
+        lines.append(
+            f"QQQ=${prices.get('QQQ', '?')} | SPY=${prices.get('SPY', '?')} | "
+            f"VIX={prices.get('VIX', '?')} | BTC=${prices.get('BTC', '?')}"
+        )
+        lines.append(f"ST: {c.get('short_term_outlook', '?')}")
+        lines.append(f"MT: {c.get('medium_term_outlook', '?')}")
+        lines.append(f"LT: {c.get('long_term_outlook', '?')}")
         kf = c.get("key_factors", [])
         if kf:
-            lines.append("Key factors: " + " | ".join(kf))
-        analysis = c.get("detailed_analysis", "")
-        if analysis:
-            lines.append(f"**Your analysis:** {analysis}")
-        ctp = c.get("comparison_to_previous", "")
-        if ctp:
-            lines.append(f"**What you noted changed:** {ctp}")
+            lines.append("Factors: " + " | ".join(kf))
+        changed = c.get("what_changed") or c.get("comparison_to_previous", "")
+        if changed:
+            lines.append(f"Changed: {_first_sentence(changed)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -278,6 +290,47 @@ def compute_sma(df, period: int):
     return round(df["Close"].rolling(window=period).mean().iloc[-1], 4)
 
 
+def compute_rsi(df, period: int = 14):
+    if df is None or df.empty or len(df) < period + 1:
+        return None
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(window=period).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=period).mean()
+    rs = gain.iloc[-1] / loss.iloc[-1] if loss.iloc[-1] != 0 else 100
+    return round(100 - (100 / (1 + rs)), 1)
+
+
+def compute_macd(df):
+    if df is None or df.empty or len(df) < 26:
+        return None, None
+    ema12 = df["Close"].ewm(span=12).mean()
+    ema26 = df["Close"].ewm(span=26).mean()
+    macd_line = ema12 - ema26
+    signal_line = macd_line.ewm(span=9).mean()
+    return round(macd_line.iloc[-1], 4), round(signal_line.iloc[-1], 4)
+
+
+def compute_bollinger(df, period: int = 20, std_dev: float = 2.0):
+    if df is None or df.empty or len(df) < period:
+        return None, None
+    sma = df["Close"].rolling(window=period).mean().iloc[-1]
+    std = df["Close"].rolling(window=period).std().iloc[-1]
+    return round(sma + std_dev * std, 2), round(sma - std_dev * std, 2)
+
+
+def compute_atr(df, period: int = 14):
+    if df is None or df.empty or len(df) < period + 1:
+        return None
+    import numpy as np
+    high = df["High"].values
+    low = df["Low"].values
+    close = np.roll(df["Close"].values, 1)
+    close[0] = np.nan
+    tr = np.maximum(high - low, np.maximum(np.abs(high - close), np.abs(low - close)))
+    atr_series = float(np.nanmean(tr[-period:]))
+    return round(atr_series, 4)
+
+
 def format_ohlcv_table(df, label: str, last_n: int) -> str:
     if df is None or df.empty:
         return f"*{label}: No data available*\n"
@@ -312,7 +365,26 @@ def format_ohlcv_table(df, label: str, last_n: int) -> str:
         vol_trend = round(vol_recent / vol_prior * 100 - 100, 1)
         stats.append(f"Vol trend: {vol_trend:+.1f}%")
 
-    lines.append(f"\n*Stats: {' | '.join(stats)}*\n")
+    # Technical indicators (only for daily/weekly with enough data)
+    rsi = compute_rsi(df)
+    macd, macd_signal = compute_macd(df)
+    bb_upper, bb_lower = compute_bollinger(df)
+    atr = compute_atr(df)
+
+    tech = []
+    if rsi is not None:
+        tech.append(f"RSI14: {rsi}")
+    if macd is not None:
+        tech.append(f"MACD: {macd}/{macd_signal}")
+    if bb_upper is not None:
+        tech.append(f"BB: {bb_lower}-{bb_upper}")
+    if atr is not None:
+        tech.append(f"ATR14: {atr}")
+
+    lines.append(f"\n*Stats: {' | '.join(stats)}*")
+    if tech:
+        lines.append(f"*Technicals: {' | '.join(tech)}*")
+    lines.append("")
     return "\n".join(lines)
 
 
@@ -338,9 +410,9 @@ def format_market_data_for_prompt(market_data: dict) -> str:
                 info_parts.append(f"52w H/L: ${info['week52_high']:.2f}/${info.get('week52_low', 0):.2f}")
             sections.append("**Info:** " + " | ".join(info_parts) + "\n")
 
-        sections.append(format_ohlcv_table(entry.get("hourly"), "Hourly", 24))
-        sections.append(format_ohlcv_table(entry.get("daily"), "Daily", 30))
-        sections.append(format_ohlcv_table(entry.get("weekly"), "Weekly", 12))
+        sections.append(format_ohlcv_table(entry.get("hourly"), "Hourly", 12))
+        sections.append(format_ohlcv_table(entry.get("daily"), "Daily", 15))
+        sections.append(format_ohlcv_table(entry.get("weekly"), "Weekly", 8))
 
     return "\n".join(sections)
 
