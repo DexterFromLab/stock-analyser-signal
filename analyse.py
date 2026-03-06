@@ -103,6 +103,10 @@ def setup_logging():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     trim_log_file()
 
+    # Prevent duplicate handlers if called multiple times
+    if log.handlers:
+        return
+
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
     file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
@@ -129,9 +133,27 @@ def load_config() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════
 # Step 2 — Load previous analyses + conclusions
 # ═══════════════════════════════════════════════════════════════════════════
+def _ensure_csv_header(path, columns):
+    """Ensure CSV file has the correct header row. Fix if missing."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    with open(path, "r", encoding="utf-8") as f:
+        first_line = f.readline()
+    if first_line.strip().startswith(columns[0] + ","):
+        return  # header present
+    # Header missing — prepend it
+    log.warning("CSV %s missing header — repairing.", path.name)
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    header = ",".join(columns) + "\n"
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        f.write(header + content)
+
+
 def load_history(lookback: int) -> list[dict]:
     if not HISTORY_CSV.exists():
         return []
+    _ensure_csv_header(HISTORY_CSV, HISTORY_COLUMNS)
     rows = []
     with open(HISTORY_CSV, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
@@ -680,7 +702,7 @@ def _extract_json_from_text(text: str) -> dict | None:
 # ═══════════════════════════════════════════════════════════════════════════
 def save_result(result: dict, run_number: int, run_id: str, timestamp: str,
                 market_data: dict, model: str, cost: float | None, discord_msg: str):
-    write_header = not HISTORY_CSV.exists()
+    write_header = not HISTORY_CSV.exists() or HISTORY_CSV.stat().st_size == 0
 
     qqq_price = market_data.get("QQQ", {}).get("info", {}).get("price")
     ixic_price = market_data.get("^IXIC", {}).get("info", {}).get("price")
