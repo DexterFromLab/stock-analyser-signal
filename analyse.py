@@ -535,7 +535,7 @@ def run_analysis(
 
     now = datetime.now()
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    run_number = (len(history) + 1) if history else 1
+    run_number = (int(history[-1]["run_number"]) + 1) if history else 1
 
     time_since = "N/A (first run)"
     if history:
@@ -912,6 +912,36 @@ def should_notify(history: list[dict], result: dict) -> tuple[bool, str]:
     except (ValueError, TypeError):
         pass
 
+    # Also compare against the last *notified* run (non-empty discord_message)
+    # to catch gradual drift that individually never triggers the threshold
+    last_notified = None
+    for h in reversed(history):
+        if h.get("discord_message"):
+            last_notified = h
+            break
+
+    if last_notified and last_notified is not prev:
+        # Recommendation changed since last notification
+        notified_rec = last_notified.get("recommendation", "")
+        if new_rec and notified_rec != new_rec:
+            return True, f"recommendation changed since last notification: {notified_rec} -> {new_rec}"
+
+        # Score drift since last notification
+        try:
+            notified_st = int(last_notified.get("score_short_term", 0))
+            new_st = int(result.get("score_short_term", 0))
+            if abs(new_st - notified_st) >= 10:
+                return True, f"short-term score drifted {abs(new_st - notified_st)} pts since last notification ({notified_st} -> {new_st})"
+        except (ValueError, TypeError):
+            pass
+        try:
+            notified_mt = int(last_notified.get("score_medium_term", 0))
+            new_mt = int(result.get("score_medium_term", 0))
+            if abs(new_mt - notified_mt) >= 10:
+                return True, f"medium-term score drifted {abs(new_mt - notified_mt)} pts since last notification ({notified_mt} -> {new_mt})"
+        except (ValueError, TypeError):
+            pass
+
     # No significant change
     return False, "no significant change vs previous analysis"
 
@@ -1033,7 +1063,7 @@ def main():
     log.info("[2/7] Loading previous analyses...")
     history = load_history(lookback)
     conclusions = load_conclusions(lookback)
-    run_number = len(history) + 1
+    run_number = int(history[-1]["run_number"]) + 1 if history else 1
     history_prompt = format_history_for_prompt(history, conclusions)
     log.info("Loaded %d previous analyses, %d conclusions.", len(history), len(conclusions))
 
