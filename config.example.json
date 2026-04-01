@@ -11,6 +11,8 @@
     "active": true,
     "webhook_url": "",
     "webhook_url_pl": "",
+    "webhook_url_forex_en": "",
+    "webhook_url_forex_pl": "",
     "notify_scheduler": false,
     "notify_claude": false
   },
@@ -39,6 +41,11 @@
       ],
       "crypto_ref": [
         "BTC-USD"
+      ],
+      "forex": [
+        "EURUSD=X",
+        "JPY=X",
+        "GBPUSD=X"
       ]
     },
     "rss_feeds": [

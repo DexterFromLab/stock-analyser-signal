@@ -1,5 +1,5 @@
 """
-Stock Analyser Signal — NASDAQ Market Analysis Tool
+Stock & Forex Analyser Signal — NASDAQ + Forex Market Analysis Tool
 Fetches market data, scrapes news, runs AI analysis, logs to CSV, notifies Discord.
 """
 
@@ -56,6 +56,51 @@ SNAPSHOT_COLUMNS = [
     "pe_ratio", "week52_high", "week52_low",
     "sma5", "sma20", "sma50",
 ]
+
+FOREX_HISTORY_CSV = DATA_DIR / "forex_history.csv"
+FOREX_CONCLUSIONS_FILE = DATA_DIR / "forex_conclusions.json"
+
+FOREX_HISTORY_COLUMNS = [
+    "timestamp", "run_number", "run_id",
+    "pair", "direction", "conviction_24h", "conviction_1w", "conviction_1m",
+    "rate", "target_24h", "target_1w", "support", "resistance",
+    "outlook", "key_drivers",
+    "market_summary", "comparison_to_previous",
+    "discord_message", "model", "cost_usd",
+]
+
+FOREX_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "pairs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "pair":           {"type": "string", "description": "Pair name, e.g. EUR/USD"},
+                    "direction":      {"type": "string", "enum": ["STRONG_BULLISH", "BULLISH", "NEUTRAL", "BEARISH", "STRONG_BEARISH"]},
+                    "conviction_24h": {"type": "integer", "minimum": 1, "maximum": 100, "description": "Conviction score for 24h horizon (1=strong bearish, 100=strong bullish for base currency)"},
+                    "conviction_1w":  {"type": "integer", "minimum": 1, "maximum": 100, "description": "Conviction score for 1-week horizon"},
+                    "conviction_1m":  {"type": "integer", "minimum": 1, "maximum": 100, "description": "Conviction score for 1-month horizon"},
+                    "current_rate":   {"type": "number"},
+                    "target_24h":     {"type": "number", "description": "Expected rate in 24h"},
+                    "target_1w":      {"type": "number", "description": "Expected rate in 1 week"},
+                    "support":        {"type": "number", "description": "Key support level"},
+                    "resistance":     {"type": "number", "description": "Key resistance level"},
+                    "outlook":        {"type": "string", "description": "1-2 sentence outlook for this pair"},
+                    "key_drivers":    {"type": "array", "items": {"type": "string"}, "minItems": 2, "maxItems": 4},
+                },
+                "required": ["pair", "direction", "conviction_24h", "conviction_1w", "conviction_1m",
+                              "current_rate", "target_24h", "target_1w", "support", "resistance",
+                              "outlook", "key_drivers"],
+            },
+        },
+        "market_summary":        {"type": "string", "description": "100-200 word forex market overview"},
+        "key_events":            {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 5, "description": "Key upcoming events affecting forex (central bank decisions, data releases)"},
+        "comparison_to_previous": {"type": "string", "description": "What changed vs the last forex analysis (or 'First analysis' if none)"},
+    },
+    "required": ["pairs", "market_summary", "key_events", "comparison_to_previous"],
+}
 
 ANALYSIS_SCHEMA = {
     "type": "object",
@@ -257,11 +302,134 @@ def format_history_for_prompt(history: list[dict], conclusions: list[dict]) -> s
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Forex — Load / Save / Format history
+# ═══════════════════════════════════════════════════════════════════════════
+def load_forex_history(lookback: int) -> list[dict]:
+    if not FOREX_HISTORY_CSV.exists():
+        return []
+    _ensure_csv_header(FOREX_HISTORY_CSV, FOREX_HISTORY_COLUMNS)
+    rows = []
+    with open(FOREX_HISTORY_CSV, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    return rows[-lookback:] if len(rows) > lookback else rows
+
+
+def load_forex_conclusions(lookback: int) -> list[dict]:
+    if not FOREX_CONCLUSIONS_FILE.exists():
+        return []
+    try:
+        with open(FOREX_CONCLUSIONS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data[-lookback:] if len(data) > lookback else data
+    except (json.JSONDecodeError, IOError):
+        return []
+
+
+def save_forex_conclusion(result: dict, run_number: int, timestamp: str, forex_data: dict):
+    conclusions = []
+    if FOREX_CONCLUSIONS_FILE.exists():
+        try:
+            with open(FOREX_CONCLUSIONS_FILE, "r", encoding="utf-8") as f:
+                conclusions = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            conclusions = []
+
+    pairs_summary = []
+    for p in result.get("pairs", []):
+        pairs_summary.append({
+            "pair": p.get("pair"),
+            "direction": p.get("direction"),
+            "conviction_24h": p.get("conviction_24h"),
+            "conviction_1w": p.get("conviction_1w"),
+            "conviction_1m": p.get("conviction_1m"),
+            "rate": p.get("current_rate"),
+            "outlook": _first_sentence(p.get("outlook", "")),
+        })
+
+    entry = {
+        "timestamp": timestamp,
+        "run_number": run_number,
+        "pairs": pairs_summary,
+        "market_summary": _first_sentence(result.get("market_summary", ""), 300),
+        "key_events": result.get("key_events", [])[:3],
+        "what_changed": _first_sentence(result.get("comparison_to_previous", "")),
+    }
+
+    conclusions.append(entry)
+    if len(conclusions) > 10:
+        conclusions = conclusions[-10:]
+    with open(FOREX_CONCLUSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(conclusions, f, indent=2, ensure_ascii=False)
+
+
+def save_forex_result(result: dict, run_number: int, run_id: str, timestamp: str,
+                      forex_data: dict, model: str, cost: float | None, discord_msg: str):
+    write_header = not FOREX_HISTORY_CSV.exists() or FOREX_HISTORY_CSV.stat().st_size == 0
+
+    with open(FOREX_HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=FOREX_HISTORY_COLUMNS)
+        if write_header:
+            writer.writeheader()
+        for p in result.get("pairs", []):
+            writer.writerow({
+                "timestamp": timestamp,
+                "run_number": run_number,
+                "run_id": run_id,
+                "pair": p.get("pair"),
+                "direction": p.get("direction"),
+                "conviction_24h": p.get("conviction_24h"),
+                "conviction_1w": p.get("conviction_1w"),
+                "conviction_1m": p.get("conviction_1m"),
+                "rate": p.get("current_rate"),
+                "target_24h": p.get("target_24h"),
+                "target_1w": p.get("target_1w"),
+                "support": p.get("support"),
+                "resistance": p.get("resistance"),
+                "outlook": p.get("outlook"),
+                "key_drivers": "|".join(p.get("key_drivers", [])),
+                "market_summary": result.get("market_summary"),
+                "comparison_to_previous": result.get("comparison_to_previous"),
+                "discord_message": discord_msg,
+                "model": model,
+                "cost_usd": cost,
+            })
+
+
+def format_forex_history_for_prompt(conclusions: list[dict]) -> str:
+    if not conclusions:
+        return "No previous forex analyses available. This is the first run."
+
+    lines = ["## Your Previous Forex Analyses (most recent last)\n"]
+    for c in conclusions:
+        lines.append(
+            f"**Run #{c.get('run_number', '?')}** — {c.get('timestamp', '?')}"
+        )
+        for p in c.get("pairs", []):
+            lines.append(
+                f"  {p.get('pair')}: **{p.get('direction')}** | "
+                f"24h={p.get('conviction_24h')} 1w={p.get('conviction_1w')} 1m={p.get('conviction_1m')} | "
+                f"Rate: {p.get('rate')}"
+            )
+        if c.get("outlook"):
+            lines.append(f"  Outlook: {c.get('outlook')}")
+        changed = c.get("what_changed", "")
+        if changed:
+            lines.append(f"  Changed: {changed}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Step 3 — Fetch OHLCV market data via yfinance
 # ═══════════════════════════════════════════════════════════════════════════
 def fetch_market_data(symbols_cfg: dict, periods_cfg: dict) -> dict:
     """Fetch hourly/daily/weekly OHLCV for all symbols. Returns dict keyed by symbol."""
     all_symbols = symbols_cfg["primary"] + symbols_cfg["secondary"] + symbols_cfg["crypto_ref"]
+    forex = symbols_cfg.get("forex", [])
+    all_symbols = all_symbols + forex
     data = {}
 
     for sym in all_symbols:
@@ -689,12 +857,309 @@ def _extract_json_from_text(text: str) -> dict | None:
         candidate = text[first_brace:last_brace + 1]
         try:
             parsed = json.loads(candidate)
-            if "score_short_term" in parsed:
+            if "score_short_term" in parsed or "pairs" in parsed:
                 return parsed
         except json.JSONDecodeError:
             pass
 
     return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Forex — Claude analysis
+# ═══════════════════════════════════════════════════════════════════════════
+FOREX_PAIR_LABELS = {
+    "EURUSD=X": "EUR/USD",
+    "JPY=X": "USD/JPY",
+    "GBPUSD=X": "GBP/USD",
+}
+
+
+def run_forex_analysis(
+    forex_data: dict,
+    news_prompt: str,
+    forex_history_prompt: str,
+    claude_cfg: dict,
+    forex_history: list[dict],
+) -> tuple[dict, str, float | None]:
+    """Send forex data to Claude and get structured analysis."""
+
+    now = datetime.now()
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Build forex-specific market prompt
+    forex_market = ["## Forex Market Data\n"]
+    for sym, entry in forex_data.items():
+        label = FOREX_PAIR_LABELS.get(sym, sym)
+        forex_market.append(f"### {label} ({sym})\n")
+
+        info = entry.get("info", {})
+        if info.get("price"):
+            parts = [f"Rate: {info['price']}"]
+            if info.get("previous_close"):
+                chg = round((info["price"] - info["previous_close"]) / info["previous_close"] * 100, 4)
+                parts.append(f"Prev Close: {info['previous_close']} ({chg:+.4f}%)")
+            forex_market.append("**Info:** " + " | ".join(parts) + "\n")
+
+        forex_market.append(format_ohlcv_table(entry.get("hourly"), "Hourly", 24))
+        forex_market.append(format_ohlcv_table(entry.get("daily"), "Daily", 20))
+        forex_market.append(format_ohlcv_table(entry.get("weekly"), "Weekly", 12))
+
+    forex_market_prompt = "\n".join(forex_market)
+
+    pair_names = [FOREX_PAIR_LABELS.get(s, s) for s in forex_data.keys()]
+
+    json_example = json.dumps({
+        "pairs": [
+            {
+                "pair": "EUR/USD",
+                "direction": "BULLISH",
+                "conviction_24h": 62,
+                "conviction_1w": 55,
+                "conviction_1m": 48,
+                "current_rate": 1.0845,
+                "target_24h": 1.0870,
+                "target_1w": 1.0920,
+                "support": 1.0800,
+                "resistance": 1.0900,
+                "outlook": "EUR supported by ECB hawkish stance...",
+                "key_drivers": ["ECB rate decision", "US NFP data"],
+            }
+        ],
+        "market_summary": "100-200 word forex market overview...",
+        "key_events": ["ECB meeting Thursday", "US CPI Wednesday"],
+        "comparison_to_previous": "What changed vs last run...",
+    }, indent=2)
+
+    prompt = f"""# Forex Signal Analysis — {now_str}
+
+**Date:** {now.strftime("%A, %B %d, %Y")} | **Time:** {now.strftime("%H:%M:%S")}
+
+{forex_history_prompt}
+
+{forex_market_prompt}
+
+{news_prompt}
+
+---
+
+## Instructions
+
+Analyse the forex pairs: {', '.join(pair_names)}.
+
+Use ALL the data above — price action, technical indicators (SMAs, RSI, MACD, Bollinger Bands), news sentiment, and macro context (interest rates from ^TNX, risk sentiment from VIX, USD strength).
+
+Direction scoring guide (for the BASE currency in each pair):
+- 1-20: STRONG_BEARISH — clear downtrend for base currency
+- 21-40: BEARISH — bearish signals outweigh bullish
+- 41-60: NEUTRAL — mixed signals, no clear direction
+- 61-80: BULLISH — bullish signals outweigh bearish
+- 81-100: STRONG_BULLISH — clear uptrend for base currency
+
+Note: For USD/JPY, the base currency is USD. BULLISH = USD strengthens vs JPY.
+
+Time horizons:
+- conviction_24h: next 24 hours outlook
+- conviction_1w: next 1 week outlook
+- conviction_1m: next 1 month outlook
+
+Provide specific support/resistance levels and rate targets based on the technical data.
+Compare with your previous analyses if available.
+
+Respond with ONLY this JSON structure (no other text):
+
+```json
+{json_example}
+```
+
+Analyse ALL {len(pair_names)} pairs. key_drivers must reference specific data points. direction must be one of: STRONG_BULLISH, BULLISH, NEUTRAL, BEARISH, STRONG_BEARISH.
+"""
+
+    json_system = "You are a quantitative forex analyst. You ALWAYS respond with valid JSON only. Never use markdown formatting, never add text outside the JSON object."
+
+    log.debug("=" * 40 + " FOREX SYSTEM PROMPT " + "=" * 40)
+    log.debug(json_system)
+    log.debug("=" * 40 + " FOREX USER PROMPT " + "=" * 40)
+    log.debug(prompt)
+
+    claude = ClaudeCode(
+        model=claude_cfg.get("model"),
+        system_prompt=json_system,
+        timeout=claude_cfg.get("timeout", 300),
+        max_budget_usd=claude_cfg.get("max_budget_usd", 0.50),
+    )
+
+    resp = claude.ask(prompt)
+    model = claude_cfg.get("model") or "default"
+    cost = resp.cost_usd
+    if resp.model:
+        model = resp.model
+
+    log.debug("=" * 40 + " FOREX RAW RESPONSE " + "=" * 40)
+    log.debug("resp.text: %s", resp.text)
+    log.debug("resp.model: %s | resp.cost_usd: %s", resp.model, resp.cost_usd)
+
+    result = _parse_json_response(resp)
+    return result, model, cost
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Forex — Discord message + notification logic
+# ═══════════════════════════════════════════════════════════════════════════
+def forex_direction_emoji(direction: str) -> str:
+    return {
+        "STRONG_BULLISH": "\U0001f7e2",  # green
+        "BULLISH": "\U0001f7e1",          # yellow
+        "NEUTRAL": "\u26aa",              # white
+        "BEARISH": "\U0001f534",          # red
+        "STRONG_BEARISH": "\u26d4",       # no entry
+    }.get(direction, "\u2753")
+
+
+def build_forex_discord_message(result: dict, timestamp: str, run_number: int,
+                                forex_history: list[dict]) -> str:
+    pairs = result.get("pairs", [])
+
+    pair_sections = []
+    for p in pairs:
+        pair_name = p.get("pair", "?")
+        direction = p.get("direction", "?")
+        c24 = p.get("conviction_24h", "?")
+        c1w = p.get("conviction_1w", "?")
+        c1m = p.get("conviction_1m", "?")
+        rate = p.get("current_rate", "?")
+        t24 = p.get("target_24h", "?")
+        t1w = p.get("target_1w", "?")
+        sup = p.get("support", "?")
+        res = p.get("resistance", "?")
+
+        pair_sections.append(
+            f"{forex_direction_emoji(direction)} **{pair_name}** — **{direction.replace('_', ' ')}**\n"
+            f"\u2502 Rate: **{rate}** | Target 24h: {t24} | Target 1w: {t1w}\n"
+            f"\u2502 Support: {sup} | Resistance: {res}\n"
+            f"\u2502 24h: `{score_bar(c24)}` **{c24}/100**\n"
+            f"\u2502 1w:  `{score_bar(c1w)}` **{c1w}/100**\n"
+            f"\u2502 1m:  `{score_bar(c1m)}` **{c1m}/100**\n"
+            f"\u2502 {p.get('outlook', '')}\n"
+            f"\u2502 Drivers: {', '.join(p.get('key_drivers', []))}"
+        )
+
+    pairs_block = "\n\n".join(pair_sections)
+
+    events = result.get("key_events", [])
+    events_block = "\n".join(f"\u2502 \u2022 {e}" for e in events)
+
+    prev_section = ""
+    if result.get("comparison_to_previous"):
+        prev_section = f"\n\U0001f504 **vs Previous:**\n{result['comparison_to_previous']}"
+
+    msg = f"""\U0001f4b1 **Forex Signal** \u2502 Run #{run_number} \u2502 {timestamp}
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+{pairs_block}
+
+\U0001f4c5 **Key Events:**
+{events_block}
+
+\U0001f4dd **Market Summary:**
+{result.get('market_summary', '?')}
+{prev_section}
+\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+_This is not investment advice. Automated AI-generated forex analysis for informational purposes only._"""
+
+    return msg.strip()
+
+
+def should_notify_forex(forex_history: list[dict], result: dict) -> tuple[bool, str]:
+    """Determine if forex Discord notification should be sent."""
+    if not forex_history:
+        return True, "first forex run"
+
+    # Weekly gap
+    try:
+        last_ts = datetime.strptime(forex_history[-1]["timestamp"], "%Y-%m-%d %H:%M:%S")
+        if (datetime.now() - last_ts).total_seconds() >= 7 * 24 * 3600:
+            return True, "weekly forex summary"
+    except (ValueError, KeyError):
+        return True, "unable to determine last forex run time"
+
+    # Compare per pair — direction change or conviction shift
+    # Build prev state from last run's rows (multiple rows per run, one per pair)
+    prev_run = forex_history[-1].get("run_number")
+    prev_pairs = {}
+    for h in reversed(forex_history):
+        if h.get("run_number") == prev_run:
+            prev_pairs[h.get("pair")] = h
+        else:
+            break
+
+    for p in result.get("pairs", []):
+        pair = p.get("pair")
+        prev = prev_pairs.get(pair)
+        if not prev:
+            return True, f"new pair: {pair}"
+
+        if prev.get("direction") != p.get("direction"):
+            return True, f"{pair} direction changed: {prev.get('direction')} -> {p.get('direction')}"
+
+        try:
+            prev_c24 = int(prev.get("conviction_24h", 0))
+            new_c24 = int(p.get("conviction_24h", 0))
+            if abs(new_c24 - prev_c24) >= 15:
+                return True, f"{pair} 24h conviction shifted {abs(new_c24 - prev_c24)} pts"
+        except (ValueError, TypeError):
+            pass
+
+        try:
+            prev_c1w = int(prev.get("conviction_1w", 0))
+            new_c1w = int(p.get("conviction_1w", 0))
+            if abs(new_c1w - prev_c1w) >= 15:
+                return True, f"{pair} 1w conviction shifted {abs(new_c1w - prev_c1w)} pts"
+        except (ValueError, TypeError):
+            pass
+
+    return False, "no significant forex change"
+
+
+def send_forex_discord_diagnostic(config: dict, timestamp: str, run_number: int, reason: str):
+    webhook_en = config.get("discord", {}).get("webhook_url_forex_en")
+    webhook_pl = config.get("discord", {}).get("webhook_url_forex_pl")
+
+    msg_en = (
+        f"\U0001f504 **Forex Check** \u2502 Run #{run_number} \u2502 {timestamp}\n"
+        f"_{reason} \u2014 no update sent_"
+    )
+    if webhook_en:
+        send_discord(config, msg_en, webhook_url=webhook_en)
+
+    reason_pl_map = {
+        "no significant forex change": "brak istotnych zmian forex",
+        "first forex run": "pierwszy run forex",
+    }
+    reason_pl = reason_pl_map.get(reason, reason)
+    if webhook_pl:
+        msg_pl = (
+            f"\U0001f504 **Sprawdzenie Forex** \u2502 Run #{run_number} \u2502 {timestamp}\n"
+            f"_{reason_pl} \u2014 brak aktualizacji_"
+        )
+        send_discord(config, msg_pl, webhook_url=webhook_pl)
+
+
+def trim_forex_history():
+    if FOREX_HISTORY_CSV.exists():
+        rows = []
+        with open(FOREX_HISTORY_CSV, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            for row in reader:
+                rows.append(row)
+        # 3 pairs * 10 runs = 30 rows max
+        if len(rows) > 30:
+            rows = rows[-30:]
+            with open(FOREX_HISTORY_CSV, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1052,13 +1517,13 @@ def send_discord(config: dict, message: str, webhook_url: str | None = None):
 def main():
     setup_logging()
     log.info("=" * 60)
-    log.info("Stock Analyser Signal — Starting analysis pipeline")
+    log.info("Stock & Forex Analyser Signal — Starting pipeline")
     log.info("=" * 60)
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Step 1: Load config
-    log.info("[1/7] Loading config...")
+    # ── Step 1: Load config ──
+    log.info("[1/9] Loading config...")
     config = load_config()
     analysis_cfg = config.get("analysis", {})
     symbols_cfg = analysis_cfg.get("symbols", {})
@@ -1071,105 +1536,175 @@ def main():
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log.info("Run ID: %s | Timestamp: %s", run_id, timestamp)
 
-    # Step 2: Load history + conclusions
-    log.info("[2/7] Loading previous analyses...")
+    # ── Step 2: Load history ──
+    log.info("[2/9] Loading previous analyses...")
     history = load_history(lookback)
     conclusions = load_conclusions(lookback)
     run_number = int(history[-1]["run_number"]) + 1 if history else 1
     history_prompt = format_history_for_prompt(history, conclusions)
-    log.info("Loaded %d previous analyses, %d conclusions.", len(history), len(conclusions))
+    log.info("Loaded %d stock analyses, %d conclusions.", len(history), len(conclusions))
 
-    # Step 3: Fetch market data
-    log.info("[3/7] Fetching market data...")
+    forex_history = load_forex_history(lookback * 3)  # 3 pairs per run
+    forex_conclusions = load_forex_conclusions(lookback)
+    forex_run_number = run_number  # same run numbering
+    forex_history_prompt = format_forex_history_for_prompt(forex_conclusions)
+    log.info("Loaded %d forex history rows, %d forex conclusions.", len(forex_history), len(forex_conclusions))
+
+    # ── Step 3: Fetch market data (stocks + forex together) ──
+    log.info("[3/9] Fetching market data...")
     market_data = fetch_market_data(symbols_cfg, periods_cfg)
-    market_prompt = format_market_data_for_prompt(market_data)
     log.info("Fetched data for %d symbols.", len(market_data))
 
-    # Step 4: Save snapshot
-    log.info("[4/7] Saving market snapshot...")
+    # Split stock vs forex data
+    forex_symbols = symbols_cfg.get("forex", [])
+    stock_data = {k: v for k, v in market_data.items() if k not in forex_symbols}
+    forex_data = {k: v for k, v in market_data.items() if k in forex_symbols}
+
+    market_prompt = format_market_data_for_prompt(stock_data)
+
+    # ── Step 4: Save snapshot ──
+    log.info("[4/9] Saving market snapshot...")
     save_snapshot(market_data, run_id, timestamp)
     log.info("Snapshot saved to %s", SNAPSHOT_CSV)
 
-    # Step 5: Scrape news
-    log.info("[5/7] Scraping news...")
+    # ── Step 5: Scrape news ──
+    log.info("[5/9] Scraping news...")
     news_prompt = fetch_news(rss_feeds)
     log.info("News scraping complete.")
 
-    # Step 6: Run Claude analysis
-    log.info("[6/7] Running Claude analysis...")
+    # ══════════════════════════════════════════════════════════════════════
+    # STOCK ANALYSIS
+    # ══════════════════════════════════════════════════════════════════════
+    log.info("[6/9] Running STOCK Claude analysis...")
     result, model, cost = run_analysis(market_prompt, news_prompt, history_prompt, claude_cfg, config, history)
 
     is_structured = not ("raw_text" in result and len(result) == 1)
 
     if is_structured:
-        log.info("Analysis complete. Model: %s | Cost: $%s", model, cost or "?")
+        log.info("Stock analysis complete. Model: %s | Cost: $%s", model, cost or "?")
         log.info("Recommendation: %s | Scores: %s/%s/%s",
                  result.get("recommendation"),
                  result.get("score_short_term"), result.get("score_medium_term"), result.get("score_long_term"))
     else:
         log.warning("Claude returned raw text instead of structured JSON.")
-        log.warning("Will use raw text for notification.")
 
-    # Step 7: Decide whether to notify
-    log.info("[7/8] Evaluating significance...")
+    # Evaluate stock significance
+    log.info("[7/9] Evaluating stock significance...")
     notify, notify_reason = should_notify(history, result if is_structured else {})
 
     if not notify:
-        # Diagnostic message — save result (for continuity) but no translation
         rec = result.get("recommendation", "?") if is_structured else "?"
         s_short = result.get("score_short_term", "?") if is_structured else "?"
-        log.info("SKIP — %s", notify_reason)
+        log.info("STOCK SKIP — %s", notify_reason)
         log.info("Current: %s (%s/100) | Saving result, skipping translation.", rec, s_short)
-        # Save so run_number stays continuous and next run sees this result
         if is_structured:
             save_result(result, run_number, run_id, timestamp, market_data, model, cost, "")
             save_conclusion(result, run_number, timestamp, market_data)
         trim_history_files()
         send_discord_diagnostic(config, timestamp, run_number, notify_reason,
                                 result if is_structured else {}, market_data)
-        log.info("Pipeline complete (no significant change).")
+    else:
+        log.info("STOCK NOTIFY — %s", notify_reason)
+
+        if is_structured:
+            discord_msg_en = build_discord_message(result, timestamp, run_number, market_data, history)
+        else:
+            raw_text = result.get("raw_text", "Analysis unavailable")
+            discord_msg_en = build_fallback_discord(raw_text, timestamp, run_number, market_data)
+
+        if is_structured:
+            save_result(result, run_number, run_id, timestamp, market_data, model, cost, discord_msg_en)
+            save_conclusion(result, run_number, timestamp, market_data)
+            log.info("Stock result saved.")
+        trim_history_files()
+
+        # Send EN
+        log.info("─" * 60)
+        log.info("Stock EN message:\n%s", discord_msg_en)
+        log.info("─" * 60)
+        send_discord(config, discord_msg_en)
+
+        # Translate and send PL
+        webhook_pl = config.get("discord", {}).get("webhook_url_pl")
+        if webhook_pl:
+            log.info("Translating stock to Polish...")
+            discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
+            if discord_msg_pl:
+                log.info("Stock translation complete.")
+                send_discord(config, discord_msg_pl, webhook_url=webhook_pl)
+            else:
+                log.warning("Stock translation failed — PL channel skipped.")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # FOREX ANALYSIS
+    # ══════════════════════════════════════════════════════════════════════
+    if not forex_data:
+        log.info("No forex symbols configured — skipping forex analysis.")
+        log.info("Pipeline complete.")
         return
 
-    log.info("NOTIFY — %s", notify_reason)
+    log.info("[8/9] Running FOREX Claude analysis...")
+    fx_result, fx_model, fx_cost = run_forex_analysis(
+        forex_data, news_prompt, forex_history_prompt, claude_cfg, forex_history
+    )
 
-    # Step 8: Build message, save, translate, send
-    log.info("[8/8] Building message, saving, translating...")
+    fx_is_structured = "pairs" in fx_result and len(fx_result.get("pairs", [])) > 0
 
-    if is_structured:
-        discord_msg_en = build_discord_message(result, timestamp, run_number, market_data, history)
+    if fx_is_structured:
+        log.info("Forex analysis complete. Model: %s | Cost: $%s", fx_model, fx_cost or "?")
+        for p in fx_result.get("pairs", []):
+            log.info("  %s: %s | 24h=%s 1w=%s 1m=%s",
+                     p.get("pair"), p.get("direction"),
+                     p.get("conviction_24h"), p.get("conviction_1w"), p.get("conviction_1m"))
     else:
-        raw_text = result.get("raw_text", "Analysis unavailable")
-        discord_msg_en = build_fallback_discord(raw_text, timestamp, run_number, market_data)
+        log.warning("Forex Claude returned unstructured response.")
 
-    # Save to CSV + conclusions (only when notifying)
-    if is_structured:
-        save_result(result, run_number, run_id, timestamp, market_data, model, cost, discord_msg_en)
-        save_conclusion(result, run_number, timestamp, market_data)
-        log.info("Result saved to %s", HISTORY_CSV)
-        log.info("Conclusions saved to %s", CONCLUSIONS_FILE)
-    trim_history_files()
+    # Evaluate forex significance
+    log.info("[9/9] Evaluating forex significance...")
+    fx_notify, fx_reason = should_notify_forex(forex_history, fx_result if fx_is_structured else {})
 
-    # Send EN to main webhook
-    log.info("─" * 60)
-    log.info("Discord EN message:\n%s", discord_msg_en)
-    log.info("─" * 60)
-    send_discord(config, discord_msg_en)
+    webhook_forex_en = config.get("discord", {}).get("webhook_url_forex_en")
+    webhook_forex_pl = config.get("discord", {}).get("webhook_url_forex_pl")
 
-    # Translate and send PL to Polish webhook
-    webhook_pl = config.get("discord", {}).get("webhook_url_pl")
-    if webhook_pl:
-        log.info("Translating to Polish...")
-        discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
-        if discord_msg_pl:
-            log.info("Translation complete.")
-            log.info("─" * 60)
-            log.info("Discord PL message:\n%s", discord_msg_pl)
-            log.info("─" * 60)
-            send_discord(config, discord_msg_pl, webhook_url=webhook_pl)
+    if not fx_notify:
+        log.info("FOREX SKIP — %s", fx_reason)
+        if fx_is_structured:
+            save_forex_result(fx_result, forex_run_number, run_id, timestamp, forex_data, fx_model, fx_cost, "")
+            save_forex_conclusion(fx_result, forex_run_number, timestamp, forex_data)
+        trim_forex_history()
+        send_forex_discord_diagnostic(config, timestamp, forex_run_number, fx_reason)
+    else:
+        log.info("FOREX NOTIFY — %s", fx_reason)
+
+        if fx_is_structured:
+            fx_discord_en = build_forex_discord_message(fx_result, timestamp, forex_run_number, forex_history)
+
+            save_forex_result(fx_result, forex_run_number, run_id, timestamp, forex_data, fx_model, fx_cost, fx_discord_en)
+            save_forex_conclusion(fx_result, forex_run_number, timestamp, forex_data)
+            log.info("Forex result saved.")
         else:
-            log.warning("Translation failed — PL channel skipped.")
-    else:
-        log.info("No webhook_url_pl configured — skipping Polish channel.")
+            fx_discord_en = (
+                f"\u2753 **Forex Signal** \u2502 Run #{forex_run_number} \u2502 {timestamp}\n"
+                f"_Analysis returned unstructured response._"
+            )
+        trim_forex_history()
+
+        # Send forex EN
+        log.info("─" * 60)
+        log.info("Forex EN message:\n%s", fx_discord_en)
+        log.info("─" * 60)
+        if webhook_forex_en:
+            send_discord(config, fx_discord_en, webhook_url=webhook_forex_en)
+
+        # Translate and send forex PL
+        if webhook_forex_pl:
+            log.info("Translating forex to Polish...")
+            fx_discord_pl = translate_to_polish(fx_discord_en, claude_cfg)
+            if fx_discord_pl:
+                log.info("Forex translation complete.")
+                send_discord(config, fx_discord_pl, webhook_url=webhook_forex_pl)
+            else:
+                log.warning("Forex translation failed — PL channel skipped.")
 
     log.info("Pipeline complete.")
 
