@@ -977,14 +977,25 @@ def send_discord_diagnostic(config: dict, timestamp: str, run_number: int,
     s_med = result.get("score_medium_term", "?")
     qqq = market_data.get("QQQ", {}).get("info", {}).get("price") or 0
 
-    msg = (
+    msg_en = (
         f"\U0001f504 **Signal Check** \u2502 Run #{run_number} \u2502 {timestamp}\n"
         f"_{reason} \u2014 no update sent_"
     )
-    send_discord(config, msg)
+    send_discord(config, msg_en)
+
+    reason_pl_map = {
+        "no significant change vs previous analysis": "brak istotnych zmian vs poprzednia analiza",
+        "first run": "pierwszy run",
+        "unable to determine last run time": "nie udało się ustalić czasu ostatniego runu",
+    }
+    reason_pl = reason_pl_map.get(reason, reason)
     webhook_pl = config.get("discord", {}).get("webhook_url_pl")
     if webhook_pl:
-        send_discord(config, msg, webhook_url=webhook_pl)
+        msg_pl = (
+            f"\U0001f504 **Sprawdzenie sygnału** \u2502 Run #{run_number} \u2502 {timestamp}\n"
+            f"_{reason_pl} \u2014 brak aktualizacji_"
+        )
+        send_discord(config, msg_pl, webhook_url=webhook_pl)
 
 
 def trim_history_files():
