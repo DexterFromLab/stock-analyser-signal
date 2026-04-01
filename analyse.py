@@ -982,6 +982,9 @@ def send_discord_diagnostic(config: dict, timestamp: str, run_number: int,
         f"_{reason} \u2014 no update sent_"
     )
     send_discord(config, msg)
+    webhook_pl = config.get("discord", {}).get("webhook_url_pl")
+    if webhook_pl:
+        send_discord(config, msg, webhook_url=webhook_pl)
 
 
 def trim_history_files():
