@@ -10,6 +10,7 @@
   "discord": {
     "active": true,
     "webhook_url": "",
+    "webhook_url_pl": "",
     "notify_scheduler": false,
     "notify_claude": false
   },

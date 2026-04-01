@@ -1020,18 +1020,16 @@ def trim_history_files():
                 writer.writerows(rows)
 
 
-def send_discord(config: dict, message: str):
+def send_discord(config: dict, message: str, webhook_url: str | None = None):
     discord_cfg = config.get("discord", {})
-    if not discord_cfg.get("active") or not discord_cfg.get("webhook_url"):
+    url = webhook_url or discord_cfg.get("webhook_url")
+    if not discord_cfg.get("active") or not url:
         log.info("Discord not configured — skipping notification.")
         return
-    notifier = DiscordNotifier(
-        webhook_url=discord_cfg["webhook_url"],
-        active=True,
-    )
+    notifier = DiscordNotifier(webhook_url=url, active=True)
     log.debug("Discord message content:\n%s", message)
     notifier.send_sync(message)
-    log.info("Discord notification sent.")
+    log.info("Discord notification sent to %s.", url[-20:])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1137,23 +1135,27 @@ def main():
         log.info("Conclusions saved to %s", CONCLUSIONS_FILE)
     trim_history_files()
 
-    # Translate
-    log.info("Translating to Polish...")
-    discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
+    # Send EN to main webhook
+    log.info("─" * 60)
+    log.info("Discord EN message:\n%s", discord_msg_en)
+    log.info("─" * 60)
+    send_discord(config, discord_msg_en)
 
-    # Combine EN + PL (skip Polish section if translation failed)
-    if discord_msg_pl:
-        log.info("Translation complete.")
-        separator = "\n\n\U0001f1f5\U0001f1f1 **WERSJA POLSKA:**\n" + "\u2550" * 40 + "\n\n"
-        discord_full = discord_msg_en + separator + discord_msg_pl
+    # Translate and send PL to Polish webhook
+    webhook_pl = config.get("discord", {}).get("webhook_url_pl")
+    if webhook_pl:
+        log.info("Translating to Polish...")
+        discord_msg_pl = translate_to_polish(discord_msg_en, claude_cfg)
+        if discord_msg_pl:
+            log.info("Translation complete.")
+            log.info("─" * 60)
+            log.info("Discord PL message:\n%s", discord_msg_pl)
+            log.info("─" * 60)
+            send_discord(config, discord_msg_pl, webhook_url=webhook_pl)
+        else:
+            log.warning("Translation failed — PL channel skipped.")
     else:
-        discord_full = discord_msg_en
-
-    log.info("─" * 60)
-    log.info("Discord message:\n%s", discord_full)
-    log.info("─" * 60)
-
-    send_discord(config, discord_full)
+        log.info("No webhook_url_pl configured — skipping Polish channel.")
 
     log.info("Pipeline complete.")
 
