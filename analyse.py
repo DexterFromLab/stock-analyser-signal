@@ -1118,6 +1118,44 @@ def should_notify_forex(forex_history: list[dict], result: dict) -> tuple[bool, 
         except (ValueError, TypeError):
             pass
 
+    # Gradual drift: compare vs last *notified* run (non-empty discord_message)
+    last_notified_run = None
+    for h in reversed(forex_history):
+        if h.get("discord_message"):
+            last_notified_run = h.get("run_number")
+            break
+
+    if last_notified_run and last_notified_run != prev_run:
+        notified_pairs = {}
+        for h in forex_history:
+            if h.get("run_number") == last_notified_run:
+                notified_pairs[h.get("pair")] = h
+
+        for p in result.get("pairs", []):
+            pair = p.get("pair")
+            notified = notified_pairs.get(pair)
+            if not notified:
+                continue
+
+            if notified.get("direction") != p.get("direction"):
+                return True, f"{pair} direction changed since last notification: {notified.get('direction')} -> {p.get('direction')}"
+
+            try:
+                notified_c24 = int(notified.get("conviction_24h", 0))
+                new_c24 = int(p.get("conviction_24h", 0))
+                if abs(new_c24 - notified_c24) >= 15:
+                    return True, f"{pair} 24h conviction drifted {abs(new_c24 - notified_c24)} pts since last notification ({notified_c24} -> {new_c24})"
+            except (ValueError, TypeError):
+                pass
+
+            try:
+                notified_c1w = int(notified.get("conviction_1w", 0))
+                new_c1w = int(p.get("conviction_1w", 0))
+                if abs(new_c1w - notified_c1w) >= 15:
+                    return True, f"{pair} 1w conviction drifted {abs(new_c1w - notified_c1w)} pts since last notification ({notified_c1w} -> {new_c1w})"
+            except (ValueError, TypeError):
+                pass
+
     return False, "no significant forex change"
 
 
